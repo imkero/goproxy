@@ -12,47 +12,64 @@ import (
 
 const (
 	DownloadRateLimit = 100 * 1024 // 100 KB/s
-	UploadRateLimit   = 50 * 1024  // 50 KB/s
 )
+
+var (
+	readBucket = ratelimit.NewBucketWithRate(float64(DownloadRateLimit), DownloadRateLimit)
+)
+
+type rateLimitedReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r rateLimitedReadCloser) Close() error {
+	return r.closer.Close()
+}
+
+func NewRateLimitedReadCloser(readCloser io.ReadCloser) rateLimitedReadCloser {
+	return rateLimitedReadCloser{
+		Reader: ratelimit.Reader(readCloser, readBucket),
+		closer: readCloser,
+	}
+}
+
+type rateLimitedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func NewRateLimitedConn(conn net.Conn, readLimit int64) rateLimitedConn {
+	return rateLimitedConn{
+		Conn:   conn,
+		reader: ratelimit.Reader(conn, readBucket),
+	}
+}
+
+func (r rateLimitedConn) Read(b []byte) (int, error) {
+	return r.reader.Read(b)
+}
 
 func main() {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = true
 
-	// Rate limit HTTP responses (download only)
-	downloadBucket := ratelimit.NewBucketWithRate(DownloadRateLimit, DownloadRateLimit)
+	// Rate limit HTTPS connections
+	proxy.ConnectDial = func(network string, addr string) (net.Conn, error) {
+		conn, err := net.Dial(network, addr)
+		if err != nil {
+			return conn, err
+		}
+
+		return NewRateLimitedConn(conn, DownloadRateLimit), nil
+	}
+
+	// Rate limit HTTP responses
 	proxy.OnResponse().DoFunc(
 		func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-			resp.Body = ratelimit.Reader(resp.Body, downloadBucket)
+			resp.Body = NewRateLimitedReadCloser(resp.Body)
 			return resp
 		})
-
-	// Rate limit HTTPS connections
-	proxy.OnRequest().HandleConnect(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-		return &goproxy.ConnectAction{
-			Action: goproxy.ConnectHijack,
-			Hijack: func(clientConn net.Conn) {
-				destConn, err := net.Dial("tcp", host)
-				if err != nil {
-					clientConn.Close()
-					return
-				}
-				rdBucket := ratelimit.NewBucketWithRate(DownloadRateLimit, DownloadRateLimit)
-				wrBucket := ratelimit.NewBucketWithRate(UploadRateLimit, UploadRateLimit)
-
-				go func() {
-					io.Copy(ratelimit.Writer(destConn, wrBucket), clientConn)
-					destConn.Close()
-					clientConn.Close()
-				}()
-				go func() {
-					io.Copy(ratelimit.Writer(clientConn, rdBucket), destConn)
-					destConn.Close()
-					clientConn.Close()
-				}()
-			},
-		}, host
-	})
 
 	log.Fatal(http.ListenAndServe(":8080", proxy))
 }
